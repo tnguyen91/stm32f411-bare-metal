@@ -39,6 +39,7 @@
 
 - [2026-11-10: Wiring a CAP1188 and checking the I2C bus](#2026-11-10-wiring-a-cap1188-and-checking-the-i2c-bus)
 - [2026-11-13: I2C1's clock and pins](#2026-11-13-i2c1s-clock-and-pins)
+- [2026-11-14: I2C1's timing and enable](#2026-11-14-i2c1s-timing-and-enable)
 
 ## 2026-10-16: Toolchain and const placement
 
@@ -1440,3 +1441,76 @@ So `scl` and `sda` came out of `run_command`, along with the three GPIOB_ODR def
 
 - Set up I2C1 itself, with its timing for PCLK1 at 16 MHz (CR2's FREQ, CCR, and TRISE), then its enable, PE in CR1.
 - Read the CAP1188's three ID registers as a shell command, and capture the transfer with PulseView's I2C decoder.
+
+## 2026-11-14: I2C1's timing and enable
+
+### Setup
+
+- This is the second half of I2C1's setup, after its clock and pins on 2026-11-13. It sets I2C1's timing for 100 kHz standard mode with PCLK1 at 16 MHz, then turns I2C1 on. Reading the CAP1188's ID registers comes next.
+- Every timing in this code counts ticks of one 16 MHz clock, the internal oscillator (HSI). It reaches the CPU and SysTick as SYSCLK, and the APB1 peripherals, USART2 and I2C1, as PCLK1. At 16 MHz, 16 ticks make one microsecond.
+
+| What counts the ticks | Ticks | Time | What it makes |
+| --- | --- | --- | --- |
+| SysTick, from 2026-10-25 | 16,000 | 1 ms | The tick behind `millis` |
+| USART2's BRR (baud rate register), from 2026-11-05 | 139 | 8.6875 µs | One UART bit at 115200 baud |
+| I2C1's CCR (clock control register) | 80 | 5 µs | Half of one SCL period at 100 kHz |
+
+| Register | Address | What I set |
+| --- | --- | --- |
+| I2C1_CR2 (control register 2) | 0x40005404 | FREQ (frequency, bits 5:0) to 16, PCLK1's frequency in MHz. I2C1 uses it to derive its data setup and hold times (RM0383) |
+| I2C1_CCR | 0x4000541C | 80 in CCR (bits 11:0), with F/S (fast/standard, bit 15) at 0 for standard mode. In standard mode, SCL's high time and low time are each CCR PCLK1 ticks, so 80 ticks of 62.5 ns make 5 µs, half of 100 kHz's 10 µs period |
+| I2C1_TRISE (rise time) | 0x40005420 | 17, standard mode's maximum SCL rise time, 1000 ns, counted in PCLK1 ticks (16), plus 1. The +1 is RM0383's rule |
+| I2C1_CR1 (control register 1) | 0x40005400 | PE (peripheral enable, bit 0), set last |
+
+- The order is RM0383's for a controller, CR2, then CCR, then TRISE, then PE in CR1. RM0383 allows CCR and TRISE to be written only while PE is 0. `usart2_init()` set UE after BRR, and `systick_start_1ms()` set ENABLE after LOAD, settings first and the on switch last.
+- TRISE is there because SCL is open-drain. When I2C1 lets go of SCL, only the breakout's 10 kΩ pull-up brings the line back high, so it rises slowly. TRISE sets the longest time I2C1's SCL feedback loop may take, which RM0383 says keeps SCL's frequency steady however slow the rise is. USART2's TX pin is push-pull and drives its line high itself, so USART2 has no such setting.
+- TRISE resets to 0x0002, not 0. Its line uses `=`, which replaces the whole register. `|=` would have kept the reset's bit 1 and left 0x13. GPIOB_MODER needed a read-modify-write because other pins' fields share it. TRISE has no other field, so `=` is right.
+- CR2, CCR, and CR1 reset to 0, and each line sets every bit its register needs, so each uses `=`, like USART2's BRR and CR1. CR2's bits above FREQ turn on I2C1's interrupts and DMA (direct memory access), which stay off.
+- The values are worked out from `PCLK1_HZ`, like `USART2_CYCLES_PER_BIT`, so a later clock change updates them.
+
+After `GPIO_AF_I2C1`, I2C1's registers.
+
+```c
+#define I2C1_CR1             (*(volatile uint32_t *)0x40005400u)
+#define I2C1_CR1_PE          (1u << 0)
+#define I2C1_CR2             (*(volatile uint32_t *)0x40005404u)
+#define I2C1_CCR             (*(volatile uint32_t *)0x4000541Cu)
+#define I2C1_TRISE           (*(volatile uint32_t *)0x40005420u)
+```
+
+After `USART2_CYCLES_PER_BIT`, the timing values.
+
+```c
+#define PCLK1_MHZ (PCLK1_HZ / 1000000u)
+#define I2C1_SCL_HZ 100000u // standard mode
+#define I2C1_CYCLES_PER_SCL_HALF (PCLK1_HZ / (2u * I2C1_SCL_HZ))
+#define I2C_SM_MAX_RISE_US 1u // standard mode's rise-time limit, 1000 ns
+#define I2C1_TRISE_CYCLES (I2C_SM_MAX_RISE_US * PCLK1_MHZ + 1u) // +1 is RM0383's rule
+```
+
+At the end of `i2c1_init()`, after the MODER lines.
+
+```c
+    I2C1_CR2 = PCLK1_MHZ; // FREQ is bits 5:0
+    I2C1_CCR = I2C1_CYCLES_PER_SCL_HALF; // F/S stays 0, so standard mode
+    I2C1_TRISE = I2C1_TRISE_CYCLES; // =, not |=, so the reset value's bit 1 doesn't stay
+    I2C1_CR1 = I2C1_CR1_PE; // enable the peripheral last, CCR and TRISE writes only while PE is 0
+```
+
+### Results
+
+Debug build (-O0). I worked out the predictions before flashing. The stop is a breakpoint on `usart2_init();` in `main`, so `i2c1_init()` has run in full.
+
+| Register | Predicted | Read |
+| --- | --- | --- |
+| I2C1_CR1 | 0x00000001 | 0x00000001 |
+| I2C1_CR2 | 0x00000010 | 0x00000010 |
+| I2C1_CCR | 0x00000050 | 0x00000050 |
+| I2C1_TRISE | 0x00000011 | 0x00000011 |
+
+- 0x10 is 16 in FREQ's bits. 0x50 is 80, with F/S and DUTY at 0. TRISE's 0x11 has no trace of the reset's 0x2, so `=` replaced it.
+- SR2 (status register 2) read 0x00000000 at the same stop. Its BUSY bit (bit 1) is 0, so with I2C1 on, it sees the bus free. RM0383 has a START go out once the bus is free, so the ID read's first START won't wait.
+
+### Next steps: I2C
+
+- Read the CAP1188's three ID registers from a shell command. Each read is START, the address with write, the register number, a repeated START, the address with read, one byte back, a NACK, and STOP. Then capture the transfer and decode it with PulseView's I2C decoder.

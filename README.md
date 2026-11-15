@@ -67,6 +67,7 @@ The shell's frames, captured with the logic analyzer at 115200 baud, 8N1. The Pu
 | UART command shell | Done: `led`, `help`, and `millis`, received by interrupt into a ring buffer, with logic analyzer captures of its frames |
 | Wire the CAP1188 and check the I2C bus | Done: both lines idle high through the breakout's 10 kΩ pull-ups. With PB8 and PB9 as open-drain outputs, `scl` and `sda` pulled each line low and released it, one at a time, on the analyzer (see LOG) |
 | I2C1's clock and pins | Done: RCC_APB1ENR read 0x00200000 after I2C1's enable and 0x00220000 after USART2's. GPIOB_MODER 0x000A0280, OTYPER 0x00000300, and AFRH 0x00000044 put PB8 and PB9 on I2C1 (AF4) as open-drain pins. With the pins handed over, a write to ODR's bit 8 changed the register but not the pin, so `scl` and `sda` came out (see LOG) |
+| I2C1's timing and enable | Done. CR2 read 0x00000010 (FREQ 16, PCLK1 in MHz), CCR 0x00000050 (80 ticks per half of SCL's period, for 100 kHz standard mode), TRISE 0x00000011 (the 1000 ns rise limit in ticks, plus 1), and CR1 0x00000001 (PE, set last). SR2 read 0, so I2C1 sees the bus free (see LOG) |
 
 ## Build and run
 

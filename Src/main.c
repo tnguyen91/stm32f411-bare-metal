@@ -44,6 +44,12 @@
 #define GPIOB_AFRH9_MASK     (0xFu << GPIOB_AFRH9_POS)
 #define GPIO_AF_I2C1         4u
 
+#define I2C1_CR1             (*(volatile uint32_t *)0x40005400u)
+#define I2C1_CR1_PE          (1u << 0)
+#define I2C1_CR2             (*(volatile uint32_t *)0x40005404u)
+#define I2C1_CCR             (*(volatile uint32_t *)0x4000541Cu)
+#define I2C1_TRISE           (*(volatile uint32_t *)0x40005420u)
+
 #define USART2_SR            (*(volatile uint32_t *)0x40004400u)
 #define USART2_SR_TXE        (1u << 7)
 #define USART2_SR_RXNE       (1u << 5)
@@ -69,6 +75,12 @@
 #define PCLK1_HZ SYSCLK_HZ
 #define USART2_BAUD 115200u
 #define USART2_CYCLES_PER_BIT ((PCLK1_HZ + (USART2_BAUD / 2u)) / USART2_BAUD)
+
+#define PCLK1_MHZ (PCLK1_HZ / 1000000u)
+#define I2C1_SCL_HZ 100000u // standard mode
+#define I2C1_CYCLES_PER_SCL_HALF (PCLK1_HZ / (2u * I2C1_SCL_HZ))
+#define I2C_SM_MAX_RISE_US 1u // standard mode's rise-time limit, 1000 ns
+#define I2C1_TRISE_CYCLES (I2C_SM_MAX_RISE_US * PCLK1_MHZ + 1u) // +1 is RM0383's rule
 
 #define LINE_BUFFER_SIZE 32u
 #define ASCII_DEL 127u
@@ -210,6 +222,11 @@ static void i2c1_init(void)
                 | ((GPIO_MODE_ALTERNATE << GPIOB_MODER8_POS) & GPIOB_MODER8_MASK);
     GPIOB_MODER = (GPIOB_MODER & ~GPIOB_MODER9_MASK)
                 | ((GPIO_MODE_ALTERNATE << GPIOB_MODER9_POS) & GPIOB_MODER9_MASK);
+
+    I2C1_CR2 = PCLK1_MHZ; // FREQ is bits 5:0
+    I2C1_CCR = I2C1_CYCLES_PER_SCL_HALF; // F/S stays 0, so standard mode
+    I2C1_TRISE = I2C1_TRISE_CYCLES; // =, not |=, so the reset value's bit 1 doesn't stay
+    I2C1_CR1 = I2C1_CR1_PE; // enable the peripheral last, CCR and TRISE writes only while PE is 0
 }
 
 static void run_command(const char *line)

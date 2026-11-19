@@ -4,7 +4,7 @@ Bare-metal C on an STM32 Nucleo-F411RE board. No HAL and no generated setup code
 
 [LOG.md](LOG.md) is the learning record behind this repo.
 
-The project is a UART command shell on USART2, built from the registers up. It takes commands typed in a PC terminal. `led` toggles LD2, `help` lists the commands, and `millis` prints the milliseconds since startup. An interrupt handler moves each received byte into a ring buffer, so commands sent back to back aren't lost while the shell replies.
+The project is a UART command shell on USART2, built from the registers up. It takes commands typed in a PC terminal. `led` toggles LD2, `help` lists the commands, `millis` prints the milliseconds since startup, and `id` reads a CAP1188 touch controller's ID registers over I2C1. An interrupt handler moves each received byte into a ring buffer, so commands sent back to back aren't lost while the shell replies.
 
 ![Two commands sent in one write: the second arrives on RX while the first reply goes out on TX](captures/two_commands.png)
 
@@ -68,6 +68,7 @@ The shell's frames, captured with the logic analyzer at 115200 baud, 8N1. The Pu
 | Wire the CAP1188 and check the I2C bus | Done: both lines idle high through the breakout's 10 kΩ pull-ups. With PB8 and PB9 as open-drain outputs, `scl` and `sda` pulled each line low and released it, one at a time, on the analyzer (see LOG) |
 | I2C1's clock and pins | Done: RCC_APB1ENR read 0x00200000 after I2C1's enable and 0x00220000 after USART2's. GPIOB_MODER 0x000A0280, OTYPER 0x00000300, and AFRH 0x00000044 put PB8 and PB9 on I2C1 (AF4) as open-drain pins. With the pins handed over, a write to ODR's bit 8 changed the register but not the pin, so `scl` and `sda` came out (see LOG) |
 | I2C1's timing and enable | Done. CR2 read 0x00000010 (FREQ 16, PCLK1 in MHz), CCR 0x00000050 (80 ticks per half of SCL's period, for 100 kHz standard mode), TRISE 0x00000011 (the 1000 ns rise limit in ticks, plus 1), and CR1 0x00000001 (PE, set last). SR2 read 0, so I2C1 sees the bus free (see LOG) |
+| Read the CAP1188's ID over I2C1 | Done: `id` printed Product ID 0x50, Manufacturer ID 0x5D, and Revision 0x83, the datasheet's values. Each read is a START, the address with write, the register number, a repeated START, the address with read, one byte, a NACK, and a STOP, and every wait has a 10 ms timeout and a NACK check. SCL moved to 80 kHz (CCR 0x00000064) for an erratum on the repeated START (ES0287 2.9.4). After the read, CR1 read 0x00000001, and SR1 and SR2 read 0 (see LOG) |
 
 ## Build and run
 
@@ -82,5 +83,6 @@ Press Continue. The terminal shows "Hello from USART2" and a `>` prompt. Type `h
 - RM0383: STM32F411xC/E reference manual (registers and memory map)
 - UM1724: STM32 Nucleo-64 boards user manual (board wiring)
 - PM0214: STM32 Cortex-M4 programming manual (SysTick, the NVIC, exceptions, and the vector table)
+- ES0287: STM32F411xC/xE device errata (known silicon limitations, such as the repeated START timing)
 
-All three are free PDFs from st.com.
+All four are free PDFs from st.com.

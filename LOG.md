@@ -40,6 +40,7 @@
 - [2026-11-10: Wiring a CAP1188 and checking the I2C bus](#2026-11-10-wiring-a-cap1188-and-checking-the-i2c-bus)
 - [2026-11-13: I2C1's clock and pins](#2026-11-13-i2c1s-clock-and-pins)
 - [2026-11-14: I2C1's timing and enable](#2026-11-14-i2c1s-timing-and-enable)
+- [2026-11-18: Reading the CAP1188's ID](#2026-11-18-reading-the-cap1188s-id)
 
 ## 2026-10-16: Toolchain and const placement
 
@@ -1514,3 +1515,157 @@ Debug build (-O0). I worked out the predictions before flashing. The stop is a b
 ### Next steps: I2C
 
 - Read the CAP1188's three ID registers from a shell command. Each read is START, the address with write, the register number, a repeated START, the address with read, one byte back, a NACK, and STOP. Then capture the transfer and decode it with PulseView's I2C decoder.
+
+## 2026-11-18: Reading the CAP1188's ID
+
+### Setup
+
+- This finishes the I2C half of the driver, after I2C1's clock and pins (2026-11-13) and its timing and enable (2026-11-14). The new `id` command reads the CAP1188's three ID registers and prints them in hex. Capturing the transfer comes next.
+- Each register read follows the CAP1188's Read Byte (Microchip DS00001620C). It's START, the address with write, the register number, a repeated START, the address with read, one byte back, a NACK from I2C1, and STOP. The CAP1188 sits at 0x29, so the address byte is 0x52 to write and 0x53 to read.
+
+| Step | The code waits for | Then the code | So the bus carries |
+| --- | --- | --- | --- |
+| 1 | The last STOP to clear | Sets START in CR1 | START |
+| 2 | SB (start bit) | Writes 0x52 into DR, which clears SB | 0x52, then the CAP1188's ACK |
+| 3 | ADDR (address sent) | Reads SR2, which clears ADDR | Nothing yet. I2C1 is now the transmitter |
+| 4 | TxE (data register empty) | Writes the register number into DR | The register number, then the CAP1188's ACK |
+| 5 | BTF (byte transfer finished) | Sets START again | The repeated START |
+| 6 | SB | Writes 0x53 into DR | 0x53, then the CAP1188's ACK |
+| 7 | ADDR | Clears ACK, reads SR2 to clear ADDR, then sets STOP | The data byte, I2C1's NACK, then STOP |
+| 8 | RxNE (data register not empty) | Reads DR | Nothing more |
+
+- CR1 now changes during a transfer, so after init it's written only with `|=` and `&= ~`, which keep PE at 1. START and STOP are requests that hardware clears, START once the START has gone out and STOP once the STOP is detected. RM0383 says not to write CR1 at all while either is still 1, because `|=` would read the pending bit and write it back as a second request. That's why each read starts by waiting for the last STOP to clear.
+- Each flag clears by a register access RM0383 names. SB clears with a read of SR1, then a write of DR. ADDR clears with a read of SR1, then a read of SR2, which is what `(void)I2C1_SR2;` is for. RxNE clears when DR is read. USART2's ORE, by comparison, clears with a read of SR, then a read of DR.
+- Step 5 waits for BTF rather than TxE. TxE only says DR is empty, while the register number may still be going out. BTF says the byte and its ACK are done, and RM0383 says BTF isn't set after a NACK.
+- Step 7 is RM0383's rule for reading one byte. Clearing ADDR starts the byte at once, so ACK has to be 0 before that. The NACK it gives tells the CAP1188 the read is over (UM10204, 3.1.6). STOP is set right after, during the byte, because a STOP request goes out after the byte in progress. Set after RxNE, it would come after a second byte.
+- Every wait has a way out. A NACK sets AF (acknowledge failure) instead of the flag the code waits for, so each wait checks AF. A START that can't go out changes no flag at all, so each wait also gives up after 10 ms of `millis()`. On a failure, the code clears AF, sets STOP, and `id` prints `no ACK` or `timeout` in place of the value.
+- SCL dropped from 100 kHz to 80 kHz. ST's errata sheet (ES0287, 2.9.4) says the setup time for a repeated START can be slightly violated in standard mode between 88 kHz and 100 kHz, and this read uses a repeated START. 80 kHz gives a whole-number CCR, 100, so the macro's integer division can't round SCL back up into that range. TRISE stays 17, since standard mode's 1000 ns rise limit didn't change.
+- The hex writer splits a byte into two 4-bit halves with a shift and a mask, and a 16-character string turns each half into a digit. `usart2_write_decimal` needs a buffer, because `% 10` gives the lowest digit first. Here the high digit comes first and there are always two, so each one goes straight out.
+
+The SCL line, in place of the 100 kHz one.
+
+```c
+#define I2C1_SCL_HZ 80000u // standard mode, at or below 88 kHz for ES0287 2.9.4 (repeated START)
+```
+
+After `usart2_write_decimal`, the hex writer.
+
+```c
+static void usart2_write_hex_byte(uint8_t value)
+{
+    static const char hex_digits[] = "0123456789ABCDEF";
+
+    usart2_write_byte(hex_digits[(value >> 4u) & 0xFu]);
+    usart2_write_byte(hex_digits[value & 0xFu]);
+}
+```
+
+The wait that every step uses, after `i2c1_init()`.
+
+```c
+/* Waits for an SR1 flag. Returns I2C1_NACK if AF sets first, I2C1_TIMEOUT after I2C1_TIMEOUT_MS. */
+static i2c1_result_t i2c1_wait_for_sr1(uint32_t flag)
+{
+    uint32_t start_ms = millis();
+
+    while ((I2C1_SR1 & flag) == 0u) {
+        if ((I2C1_SR1 & I2C1_SR1_AF) != 0u) {
+            return I2C1_NACK;
+        }
+        if ((millis() - start_ms) >= I2C1_TIMEOUT_MS) {
+            return I2C1_TIMEOUT;
+        }
+    }
+    return I2C1_OK;
+}
+```
+
+The read.
+
+```c
+/* Reads one register of a target: START, address+W, register, repeated START, address+R,
+ * one byte answered with a NACK, STOP. Returns I2C1_OK with the byte in *value, or
+ * I2C1_NACK or I2C1_TIMEOUT with a STOP requested and *value unchanged. */
+static i2c1_result_t i2c1_read_register(uint8_t target_address, uint8_t reg, uint8_t *value)
+{
+    i2c1_result_t result = i2c1_wait_for_stop_done(); // RM0383: no CR1 write while STOP is pending
+    if (result != I2C1_OK) {
+        return result;
+    }
+
+    I2C1_CR1 |= I2C1_CR1_START;
+    result = i2c1_wait_for_sr1(I2C1_SR1_SB);
+    if (result != I2C1_OK) {
+        return i2c1_abort_transfer(result);
+    }
+    I2C1_DR = (uint32_t)target_address << 1u; // write, bit 0 = 0
+
+    result = i2c1_wait_for_sr1(I2C1_SR1_ADDR);
+    if (result != I2C1_OK) {
+        return i2c1_abort_transfer(result);
+    }
+    (void)I2C1_SR2; // completes ADDR's clearing, after the wait's read of SR1
+
+    result = i2c1_wait_for_sr1(I2C1_SR1_TXE);
+    if (result != I2C1_OK) {
+        return i2c1_abort_transfer(result);
+    }
+    I2C1_DR = reg;
+
+    result = i2c1_wait_for_sr1(I2C1_SR1_BTF);
+    if (result != I2C1_OK) {
+        return i2c1_abort_transfer(result);
+    }
+    I2C1_CR1 |= I2C1_CR1_START; // repeated START
+
+    result = i2c1_wait_for_sr1(I2C1_SR1_SB);
+    if (result != I2C1_OK) {
+        return i2c1_abort_transfer(result);
+    }
+    I2C1_DR = ((uint32_t)target_address << 1) | I2C_READ_BIT; // read, bit 0 = 1
+
+    result = i2c1_wait_for_sr1(I2C1_SR1_ADDR);
+    if (result != I2C1_OK) {
+        return i2c1_abort_transfer(result);
+    }
+    I2C1_CR1 &= ~I2C1_CR1_ACK; // RM0383's one-byte rule: ACK off before ADDR clears
+    (void)I2C1_SR2;
+    I2C1_CR1 |= I2C1_CR1_STOP; // during the byte, so STOP follows it
+
+    result = i2c1_wait_for_sr1(I2C1_SR1_RXNE);
+    if (result != I2C1_OK) {
+        return result; // no need to abort, STOP is already requested
+    }
+    *value = (uint8_t)I2C1_DR;
+    return I2C1_OK;
+}
+```
+
+### Results
+
+Debug build (-O0). I worked out the predictions before flashing. Stop 1 is a breakpoint on the first `I2C1_CR1 |= I2C1_CR1_START;` in `i2c1_read_register()`, before the first START. Stop 2 is on its `return I2C1_OK;`, after the product ID's byte. Both are outside a transfer.
+
+| Register | Stop | Predicted | Read |
+| --- | --- | --- | --- |
+| I2C1_CCR | 1 | 0x00000064 | 0x00000064 |
+| I2C1_CR1 | 2 | 0x00000001 | 0x00000001 |
+| I2C1_SR1 | 2 | 0x00000000 | 0x00000000 |
+| I2C1_SR2 | 2 | 0x00000000 | 0x00000000 |
+
+All four matched. With the breakpoints removed, `id` printed the datasheet's three values.
+
+```
+> id
+Product ID: 0x50
+Manufacturer ID: 0x5D
+Revision: 0x83
+```
+
+- 0x64 is 100 ticks for each half of SCL's period, 6.25 µs, so 80 kHz. At stop 1, TRISE still read 0x00000011, and CR1, SR1, and SR2 read as they did on 2026-11-14.
+- After the read, CR1 is back to PE alone. Hardware cleared START and STOP, and the code cleared ACK. SR1 read 0 because each flag had been cleared by its own access, not because the transfer ended. Without the read of DR, RxNE would still be 1. SR2's 0 means MSL (I2C1 as controller) and BUSY cleared on the STOP.
+- DR still held 0x00000050 at stop 2. Reading DR clears RxNE, but the byte stays until the next one replaces it.
+- The stops sit outside the transfer on purpose. Showing I2C1's registers reads them, and a read of SR1 and then SR2 is ADDR's clearing sequence, while a read of DR clears RxNE. A stop inside a transfer could clear a flag before the code saw it.
+
+### Next steps: I2C
+
+- Capture the `id` transfer with the logic analyzer and decode it with PulseView's I2C decoder. Find each START, repeated START, and STOP by eye first, and measure SCL's frequency against 80 kHz.

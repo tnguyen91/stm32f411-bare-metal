@@ -46,7 +46,19 @@
 
 #define I2C1_CR1             (*(volatile uint32_t *)0x40005400u)
 #define I2C1_CR1_PE          (1u << 0)
+#define I2C1_CR1_START       (1u << 8)
+#define I2C1_CR1_STOP        (1u << 9)
+#define I2C1_CR1_ACK         (1u << 10)
 #define I2C1_CR2             (*(volatile uint32_t *)0x40005404u)
+#define I2C1_DR              (*(volatile uint32_t *)0x40005410u)
+#define I2C1_SR1             (*(volatile uint32_t *)0x40005414u)
+#define I2C1_SR1_SB          (1u << 0)
+#define I2C1_SR1_ADDR        (1u << 1)
+#define I2C1_SR1_BTF         (1u << 2)
+#define I2C1_SR1_RXNE        (1u << 6)
+#define I2C1_SR1_TXE         (1u << 7)
+#define I2C1_SR1_AF          (1u << 10)
+#define I2C1_SR2             (*(volatile uint32_t *)0x40005418u)
 #define I2C1_CCR             (*(volatile uint32_t *)0x4000541Cu)
 #define I2C1_TRISE           (*(volatile uint32_t *)0x40005420u)
 
@@ -77,10 +89,17 @@
 #define USART2_CYCLES_PER_BIT ((PCLK1_HZ + (USART2_BAUD / 2u)) / USART2_BAUD)
 
 #define PCLK1_MHZ (PCLK1_HZ / 1000000u)
-#define I2C1_SCL_HZ 100000u // standard mode
+#define I2C1_SCL_HZ 80000u // standard mode, at or below 88 kHz for ES0287 2.9.4 (repeated START)
 #define I2C1_CYCLES_PER_SCL_HALF (PCLK1_HZ / (2u * I2C1_SCL_HZ))
 #define I2C_SM_MAX_RISE_US 1u // standard mode's rise-time limit, 1000 ns
 #define I2C1_TRISE_CYCLES (I2C_SM_MAX_RISE_US * PCLK1_MHZ + 1u) // +1 is RM0383's rule
+#define I2C1_TIMEOUT_MS 10u
+#define I2C_READ_BIT 1u // R/W, bit 0 of the address byte, 1 for read, 0 for write
+
+#define CAP1188_I2C_ADDRESS 0x29u // with the breakout's 150 kOhm on ADDR_COMM
+#define CAP1188_REG_PRODUCT_ID 0xFDu
+#define CAP1188_REG_MANUFACTURER_ID 0xFEu
+#define CAP1188_REG_REVISION 0xFFu
 
 #define LINE_BUFFER_SIZE 32u
 #define ASCII_DEL 127u
@@ -162,6 +181,14 @@ static void usart2_write_decimal(uint32_t value)
     usart2_write_string(&text[first_digit]);
 }
 
+static void usart2_write_hex_byte(uint8_t value)
+{
+    static const char hex_digits[] = "0123456789ABCDEF";
+    
+    usart2_write_byte(hex_digits[(value >> 4u) & 0xFu]);
+    usart2_write_byte(hex_digits[value & 0xFu]);
+}
+
 static volatile char rx_ring[RX_RING_SIZE];
 static volatile uint32_t rx_head; // written only by handler
 static volatile uint32_t rx_tail; // written only by main
@@ -229,6 +256,123 @@ static void i2c1_init(void)
     I2C1_CR1 = I2C1_CR1_PE; // enable the peripheral last, CCR and TRISE writes only while PE is 0
 }
 
+typedef enum {
+    I2C1_OK,
+    I2C1_NACK,
+    I2C1_TIMEOUT,
+} i2c1_result_t;
+
+/* Waits for an SR1 flag. Returns I2C1_NACK if AF sets first, I2C1_TIMEOUT after I2C1_TIMEOUT_MS. */
+static i2c1_result_t i2c1_wait_for_sr1(uint32_t flag)
+{
+    uint32_t start_ms = millis();
+
+    while ((I2C1_SR1 & flag) == 0u) {
+        if ((I2C1_SR1 & I2C1_SR1_AF) != 0u) {
+            return I2C1_NACK;
+        }
+        if ((millis() - start_ms) >= I2C1_TIMEOUT_MS) {
+            return I2C1_TIMEOUT;
+        }
+    }
+    return I2C1_OK;
+}
+
+static i2c1_result_t i2c1_wait_for_stop_done(void)
+{
+    uint32_t start_ms = millis();
+
+    while ((I2C1_CR1 & I2C1_CR1_STOP) != 0u) {
+        if ((millis() - start_ms) >= I2C1_TIMEOUT_MS) {
+            return I2C1_TIMEOUT;
+        }
+    }
+    return I2C1_OK;
+}
+
+static i2c1_result_t i2c1_abort_transfer(i2c1_result_t result)
+{
+    I2C1_SR1 &= ~I2C1_SR1_AF; // clear the NACK flag if it was set
+    I2C1_CR1 |= I2C1_CR1_STOP;
+    return result;
+}
+
+/* Reads one register of a target: START, address+W, register, repeated START, address+R,
+ * one byte answered with a NACK, STOP. Returns I2C1_OK with the byte in *value, or
+ * I2C1_NACK or I2C1_TIMEOUT with a STOP requested and *value unchanged. */
+static i2c1_result_t i2c1_read_register(uint8_t target_address, uint8_t reg, uint8_t *value)
+{
+    i2c1_result_t result = i2c1_wait_for_stop_done(); // RM0383: no CR1 write while STOP is pending
+    if (result != I2C1_OK) {
+        return result;
+    }
+
+    I2C1_CR1 |= I2C1_CR1_START;
+    result = i2c1_wait_for_sr1(I2C1_SR1_SB);
+    if (result != I2C1_OK) {
+        return i2c1_abort_transfer(result);
+    }
+    I2C1_DR = (uint32_t)target_address << 1u; // write, bit 0 = 0
+
+    result = i2c1_wait_for_sr1(I2C1_SR1_ADDR);
+    if (result != I2C1_OK) {
+        return i2c1_abort_transfer(result);
+    }
+    (void)I2C1_SR2; // completes ADDR's clearing, after the wait's read of SR1
+
+    result = i2c1_wait_for_sr1(I2C1_SR1_TXE);
+    if (result != I2C1_OK) {
+        return i2c1_abort_transfer(result);
+    }
+    I2C1_DR = reg;
+
+    result = i2c1_wait_for_sr1(I2C1_SR1_BTF);
+    if (result != I2C1_OK) {
+        return i2c1_abort_transfer(result);
+    }
+    I2C1_CR1 |= I2C1_CR1_START; // repeated START
+
+    result = i2c1_wait_for_sr1(I2C1_SR1_SB);
+    if (result != I2C1_OK) {
+        return i2c1_abort_transfer(result);
+    }
+    I2C1_DR = ((uint32_t)target_address << 1) | I2C_READ_BIT; // read, bit 0 = 1
+
+    result = i2c1_wait_for_sr1(I2C1_SR1_ADDR);
+    if (result != I2C1_OK) {
+        return i2c1_abort_transfer(result);
+    }
+    I2C1_CR1 &= ~I2C1_CR1_ACK; // RM0383's one-byte rule: ACK off before ADDR clears
+    (void)I2C1_SR2;
+    I2C1_CR1 |= I2C1_CR1_STOP; // during the byte, so STOP follows it
+
+    result = i2c1_wait_for_sr1(I2C1_SR1_RXNE);
+    if (result != I2C1_OK) {
+        return result; // no need to abort, STOP is already requested
+    }
+    *value = (uint8_t)I2C1_DR;
+    return I2C1_OK;
+}
+
+static void cap1188_print_id_register(const char *label, uint8_t reg)
+{
+    uint8_t value = 0u;
+    i2c1_result_t result = i2c1_read_register(CAP1188_I2C_ADDRESS, reg, &value);
+
+    usart2_write_string(label);
+    if (result == I2C1_OK) {
+        usart2_write_string("0x");
+        usart2_write_hex_byte(value);
+    }
+    else if (result == I2C1_NACK) {
+        usart2_write_string("no ACK");
+    }
+    else {
+        usart2_write_string("timeout");
+    }
+    usart2_write_string("\r\n");
+}
+
 static void run_command(const char *line)
 {
     if (strcmp(line, "led") == 0) {
@@ -244,8 +388,13 @@ static void run_command(const char *line)
         usart2_write_decimal(millis());
         usart2_write_string(" ms\r\n");
     }
+    else if (strcmp(line, "id") == 0) {
+        cap1188_print_id_register("Product ID: ", CAP1188_REG_PRODUCT_ID);
+        cap1188_print_id_register("Manufacturer ID: ", CAP1188_REG_MANUFACTURER_ID);
+        cap1188_print_id_register("Revision: ", CAP1188_REG_REVISION);
+    }
     else if (strcmp(line, "help") == 0) {
-        usart2_write_string("Commands: led, millis, help\r\n");
+        usart2_write_string("Commands: led, millis, id, help\r\n");
     }
     else if (line[0] != '\0') {
         usart2_write_string("Unknown command: ");

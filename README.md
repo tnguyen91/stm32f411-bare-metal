@@ -16,6 +16,8 @@ https://github.com/user-attachments/assets/96a4cb40-5133-4d7f-9b38-600d61514c75
 
 ## Captures
 
+### USART2
+
 The shell's frames, captured with the logic analyzer at 115200 baud, 8N1. The PulseView sessions and all four pictures are in [captures/](captures), and the 2026-11-10 entry in [LOG.md](LOG.md) has the details.
 
 ![The startup banner decoded: Hello from USART2, CR, LF, and the prompt](captures/banner_decoded.png)
@@ -24,6 +26,16 @@ The shell's frames, captured with the logic analyzer at 115200 baud, 8N1. The Pu
 - **Nothing lost.** In the two-command picture above, RX carries 10 frames and TX 74: each command's 4 echoed letters and its 33-byte reply.
 - **Bit time.** 370 bits on TX measured 3,217.5 µs, against 3,211.8 µs at exactly 115200 baud. Of the 5.7 µs, 2.6 come from rounding the baud rate divider to 139, and 3.1 from the internal oscillator running 0.096% slow. A different measurement on 2026-11-02 put it 0.095% slow.
 - **The PC's bytes arrive back to back.** 9 frames on RX measured 780.0 µs, against 781.25 µs with no gaps.
+
+### I2C1
+
+The product ID's read from `id`, captured at 4 MHz and decoded by PulseView's I2C decoder. The PulseView session and both pictures are in [captures/](captures), and the 2026-11-19 entry in [LOG.md](LOG.md) has the details.
+
+![The product ID's read decoded, with a START, the address 0x29 with write, the register number 0xFD, a repeated START, the address with read, the byte 0x50, a NACK, and a STOP](captures/id_read_decoded.png)
+
+- **Who answers each byte.** The CAP1188 ACKs the address, the register number, and the read address. I2C1 answers the data byte with a NACK, which is how a receiving controller ends the read.
+- **START and STOP by eye.** Before adding the decoder, I found each one as an SDA edge while SCL was high. Every other SDA change comes while SCL is low.
+- **Clock rate.** 8 SCL periods measured 100.0 µs, so 80 kHz, the rate CCR 100 sets at 16 MHz.
 
 ## Hardware
 
@@ -69,6 +81,7 @@ The shell's frames, captured with the logic analyzer at 115200 baud, 8N1. The Pu
 | I2C1's clock and pins | Done: RCC_APB1ENR read 0x00200000 after I2C1's enable and 0x00220000 after USART2's. GPIOB_MODER 0x000A0280, OTYPER 0x00000300, and AFRH 0x00000044 put PB8 and PB9 on I2C1 (AF4) as open-drain pins. With the pins handed over, a write to ODR's bit 8 changed the register but not the pin, so `scl` and `sda` came out (see LOG) |
 | I2C1's timing and enable | Done. CR2 read 0x00000010 (FREQ 16, PCLK1 in MHz), CCR 0x00000050 (80 ticks per half of SCL's period, for 100 kHz standard mode), TRISE 0x00000011 (the 1000 ns rise limit in ticks, plus 1), and CR1 0x00000001 (PE, set last). SR2 read 0, so I2C1 sees the bus free (see LOG) |
 | Read the CAP1188's ID over I2C1 | Done: `id` printed Product ID 0x50, Manufacturer ID 0x5D, and Revision 0x83, the datasheet's values. Each read is a START, the address with write, the register number, a repeated START, the address with read, one byte, a NACK, and a STOP, and every wait has a 10 ms timeout and a NACK check. SCL moved to 80 kHz (CCR 0x00000064) for an erratum on the repeated START (ES0287 2.9.4). After the read, CR1 read 0x00000001, and SR1 and SR2 read 0 (see LOG) |
+| Capture the ID read on the analyzer | Done. PulseView's I2C decoder read the product ID's read as predicted, with START, `Address write: 29`, ACK, `Data write: FD`, ACK, repeated START, `Address read: 29`, ACK, `Data read: 50`, NACK, STOP. I found the START, repeated START, and STOP by eye first, each an SDA edge while SCL is high. 8 SCL periods measured 100.0 µs, so 80 kHz (see LOG) |
 
 ## Build and run
 

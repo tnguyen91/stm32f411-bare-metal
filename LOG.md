@@ -41,6 +41,7 @@
 - [2026-11-13: I2C1's clock and pins](#2026-11-13-i2c1s-clock-and-pins)
 - [2026-11-14: I2C1's timing and enable](#2026-11-14-i2c1s-timing-and-enable)
 - [2026-11-18: Reading the CAP1188's ID](#2026-11-18-reading-the-cap1188s-id)
+- [2026-11-19: Capturing the ID read](#2026-11-19-capturing-the-id-read)
 
 ## 2026-10-16: Toolchain and const placement
 
@@ -1662,10 +1663,74 @@ Revision: 0x83
 ```
 
 - 0x64 is 100 ticks for each half of SCL's period, 6.25 µs, so 80 kHz. At stop 1, TRISE still read 0x00000011, and CR1, SR1, and SR2 read as they did on 2026-11-14.
-- After the read, CR1 is back to PE alone. Hardware cleared START and STOP, and the code cleared ACK. SR1 read 0 because each flag had been cleared by its own access, not because the transfer ended. Without the read of DR, RxNE would still be 1. SR2's 0 means MSL (I2C1 as controller) and BUSY cleared on the STOP.
+- After the read, CR1 is back to PE alone. Hardware cleared START and STOP, and ACK was 0 all along, since no line in the code sets it. SR1 read 0 because each flag had been cleared by its own access, not because the transfer ended. Without the read of DR, RxNE would still be 1. SR2's 0 means MSL (I2C1 as controller) and BUSY cleared on the STOP.
 - DR still held 0x00000050 at stop 2. Reading DR clears RxNE, but the byte stays until the next one replaces it.
 - The stops sit outside the transfer on purpose. Showing I2C1's registers reads them, and a read of SR1 and then SR2 is ADDR's clearing sequence, while a read of DR clears RxNE. A stop inside a transfer could clear a flag before the code saw it.
 
 ### Next steps: I2C
 
 - Capture the `id` transfer with the logic analyzer and decode it with PulseView's I2C decoder. Find each START, repeated START, and STOP by eye first, and measure SCL's frequency against 80 kHz.
+
+## 2026-11-19: Capturing the ID read
+
+### Setup
+
+- The logic analyzer on the I2C bus at CN10. D0 is on pin 3 (PB8, SCL), D1 on pin 5 (PB9, SDA), and its ground on pin 9, the GND socket one away from AVDD (pin 7).
+- Capture at 4 MHz, 20 M samples. I typed `id` without Enter, started the capture, then pressed Enter. At 4 MHz each 12.5 µs SCL period gets 50 samples, and each edge lands within 0.25 µs.
+- The terminal printed the same three values as on 2026-11-18. Zoomed out, the capture shows three bursts, one per register read.
+- Each read is a START, the address with write (0x52), the register number, a repeated START, the address with read (0x53), one byte back, a NACK, and a STOP (2026-11-18).
+
+### START, repeated START, and STOP by eye
+
+Before adding the decoder, I found these in the product ID's read by SCL's level at each SDA edge. During a data bit, SDA holds steady while SCL is high and changes only while SCL is low (UM10204 3.1.3). So an SDA change while SCL is high can only be a START, where SDA falls, or a STOP, where SDA rises.
+
+| Moment | SDA | SCL, predicted | SCL, read |
+| --- | --- | --- | --- |
+| START | Falls | High | High |
+| Just after byte 2's ACK | Rises | Low | Low |
+| Repeated START | Falls | High | High |
+| STOP | Rises | High | High |
+
+- All four matched.
+- The rise after byte 2's ACK is the CAP1188 letting go of SDA after holding it low for its ACK. It waits until SCL is low, since a rise while SCL is high would be a STOP. SCL then goes high with SDA already high, and SDA falls for the repeated START.
+- I2C's START and STOP are conditions, each a single SDA edge while SCL is high. USART2's start and stop bits (2026-11-10) each last a whole bit time at a set level.
+
+### The decoder
+
+PulseView's I2C decoder, with SCL on D0 and SDA on D1. Its `address_format` stays at the default, shifted, which shows the 7-bit address without the read/write bit. I predicted each byte's label and its ninth pulse before adding it.
+
+| Byte | On the wire | Predicted | Decoder |
+| --- | --- | --- | --- |
+| 1 | 0x52, the address 0x29 with write | Address write, 0x29, then an ACK from the CAP1188 | `Address write: 29`, `Wr`, `ACK` |
+| 2 | 0xFD, the product ID's register number | Data write, 0xFD, then an ACK from the CAP1188 | `Data write: FD`, `ACK` |
+| 3 | 0x53, the address 0x29 with read | Address read, 0x29, then an ACK from the CAP1188 | `Address read: 29`, `Rd`, `ACK` |
+| 4 | 0x50, the product ID | Data read, 0x50, then a NACK from I2C1 | `Data read: 50`, `N` |
+
+- All four matched, and the decoder's `S`, `Sr`, and `P` sit where I found them by eye.
+- The receiver of a byte sets its ninth pulse. It pulls SDA low for an ACK, or leaves it released for a NACK (UM10204 3.1.6). The CAP1188 receives bytes 1 to 3, and I2C1 receives byte 4. The analyzer shows only SDA's level, not which device pulled it, so who set each pulse comes from that rule.
+- A controller that's receiving ends the transfer with a NACK on the last byte it wants (UM10204 3.1.6). I2C1's NACK comes from CR1's ACK bit being 0. In this code ACK is 0 from `i2c1_init()` on, since no line sets it, so clearing it before ADDR clears changes nothing yet. It starts to matter with multi-byte reads, which need ACK at 1 for every byte but the last.
+- The shifted format drops the read/write bit, so 0x52 and 0x53 both show as 29, and the eighth bit gets its own label, `Wr` or `Rd`. Datasheets give I2C addresses both ways, as the 7-bit address or as the whole byte. Sending one where the other belongs puts an address on the bus that the target doesn't answer, and byte 1 gets a NACK.
+- The decoder doesn't know byte 2 is a register number. To I2C it's a data byte after a write address. The CAP1188's Read Byte format makes it the register to read, so reading a register is a one-byte write, then a read.
+
+![The product ID's read, decoded by PulseView's I2C decoder](captures/id_read_decoded.png)
+
+### SCL's frequency
+
+- CCR 100 at 16 MHz gives SCL a high time and a low time of 6.25 µs each, so a 12.5 µs period, 80 kHz. RM0383 notes that the high time includes SCL's rise, and that the real frequency can differ because of the analog noise filter's delay.
+- I measured inside one byte. Between bytes, I2C1 holds SCL low until the code finishes its next step (RM0383 18.3.3, the notes under the controller transfer diagrams). That's why the gap after byte 1's ACK is wider than the gaps between bits.
+
+| Measurement | Span | Predicted | Read |
+| --- | --- | --- | --- |
+| Byte 2, from its first SCL rising edge to its ninth pulse's rising edge | 8 periods | 100 µs | 100.000000 µs |
+
+- 8 periods in 100 µs is 80 kHz. PulseView's readout shows 10 kHz, which is one over the whole span.
+- The reading is good to one sample, 0.25 µs, about 0.25% of the span. So the rise time and the filter delay lengthen each period by no more than that.
+- The internal oscillator's 0.1% from 2026-11-10 would be 0.1 µs here, under one sample. On 2026-11-10 it showed because 370 bits spanned 3,217.5 µs.
+
+![Byte 2's 8 SCL periods between the cursors, 100 µs](captures/id_read_scl_8_periods.png)
+
+The PulseView session is in `captures/id_read.sr`.
+
+### Next steps: I2C
+
+- This finishes the CAP1188's ID read, decoded on the analyzer. Next on the bus is a driver for an IMU, which adds register writes and multi-byte reads.
